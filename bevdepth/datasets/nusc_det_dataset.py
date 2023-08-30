@@ -231,7 +231,8 @@ class NuscDetDataset(Dataset):
                  return_depth=False,
                  sweep_idxes=list(),
                  key_idxes=list(),
-                 use_fusion=False):
+                 use_fusion=False,
+                 imnormalize=True):
         """Dataset used for bevdetection task.
         Args:
             ida_aug_conf (dict): Config for ida augmentation.
@@ -281,6 +282,7 @@ class NuscDetDataset(Dataset):
             'All `key_idxes` must less than 0.'
         self.key_idxes = [0] + key_idxes
         self.use_fusion = use_fusion
+        self.imnormalize=imnormalize
 
     def _get_sample_indices(self):
         """Load annotations from ann_file.
@@ -495,8 +497,11 @@ class NuscDetDataset(Dataset):
                     rotate=rotate_ida,
                 )
                 ida_mats.append(ida_mat)
-                img = mmcv.imnormalize(np.array(img), self.img_mean,
-                                       self.img_std, self.to_rgb)
+                if self.imnormalize:
+                    img = mmcv.imnormalize(np.array(img), self.img_mean,
+                                        self.img_std, self.to_rgb)
+                else:
+                    img = np.array(img)
                 img = torch.from_numpy(img).permute(2, 0, 1)
                 imgs.append(img)
                 intrin_mats.append(intrin_mat)

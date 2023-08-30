@@ -115,7 +115,7 @@ def generate_info(nusc, scenes, max_cam_sweeps=6, max_lidar_sweeps=10):
                             'filename']
                         sweep_lidar_info['calibrated_sensor'] = nusc.get(
                             'calibrated_sensor',
-                            cam_data['calibrated_sensor_token'])
+                            sweep_lidar_data['calibrated_sensor_token'])
                         lidar_sweeps[j][lidar_names[k]] = sweep_lidar_info
             # Remove empty sweeps.
             for i, sweep in enumerate(cam_sweeps):
