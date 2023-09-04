@@ -10,6 +10,9 @@ from PIL import Image
 from pyquaternion import Quaternion
 from torch.utils.data import Dataset
 
+from open3d import geometry
+import cv2
+
 __all__ = ['NuscDetDataset']
 
 map_name_from_general_to_detection = {
@@ -213,6 +216,23 @@ def map_pointcloud_to_image(
 
     return points, coloring
 
+def robust_crop_img(img, crop):
+    x1, y1, x2, y2 = crop
+    img = cv2.copyMakeBorder(
+        img,
+        -min(0, y1),
+        max(y2 - img.shape[0], 0),
+        -min(0, x1),
+        max(x2 - img.shape[1], 0),
+        cv2.BORDER_CONSTANT,
+        value=[0, 0, 0],
+    )
+    y2 += -min(0, y1)
+    y1 += -min(0, y1)
+    x2 += -min(0, x1)
+    x1 += -min(0, x1)
+    return img[y1:y2, x1:x2]
+
 
 class NuscDetDataset(Dataset):
 
@@ -232,7 +252,8 @@ class NuscDetDataset(Dataset):
                  sweep_idxes=list(),
                  key_idxes=list(),
                  use_fusion=False,
-                 imnormalize=True):
+                 imnormalize=True,
+                 return_mask2d=True):
         """Dataset used for bevdetection task.
         Args:
             ida_aug_conf (dict): Config for ida augmentation.
@@ -283,6 +304,7 @@ class NuscDetDataset(Dataset):
         self.key_idxes = [0] + key_idxes
         self.use_fusion = use_fusion
         self.imnormalize=imnormalize
+        self.return_mask2d = return_mask2d
 
     def _get_sample_indices(self):
         """Load annotations from ann_file.
@@ -398,6 +420,7 @@ class NuscDetDataset(Dataset):
         sweep_sensor2sensor_mats = list()
         sweep_timestamps = list()
         sweep_lidar_depth = list()
+        cam_resize, cam_resize_dims, cam_crop, cam_flip, cam_rotate_ida = list(), list(), list(), list(),list()
         if self.return_depth or self.use_fusion:
             sweep_lidar_points = list()
             for lidar_info in lidar_infos:
@@ -419,6 +442,12 @@ class NuscDetDataset(Dataset):
             resize, resize_dims, crop, flip, \
                 rotate_ida = self.sample_ida_augmentation(
                     )
+            cam_resize.append(resize)
+            cam_resize_dims.append(resize_dims) 
+            cam_crop.append(crop)
+            cam_flip.append(flip)
+            cam_rotate_ida.append(rotate_ida)
+
             for sweep_idx, cam_info in enumerate(cam_infos):
 
                 img = Image.open(
@@ -506,12 +535,12 @@ class NuscDetDataset(Dataset):
                 imgs.append(img)
                 intrin_mats.append(intrin_mat)
                 timestamps.append(cam_info[cam]['timestamp'])
-            sweep_imgs.append(torch.stack(imgs))
-            sweep_sensor2ego_mats.append(torch.stack(sensor2ego_mats))
-            sweep_intrin_mats.append(torch.stack(intrin_mats))
-            sweep_ida_mats.append(torch.stack(ida_mats))
-            sweep_sensor2sensor_mats.append(torch.stack(sensor2sensor_mats))
-            sweep_timestamps.append(torch.tensor(timestamps))
+            sweep_imgs.append(torch.stack(imgs))                        # 图像
+            sweep_sensor2ego_mats.append(torch.stack(sensor2ego_mats))  # sweep传感器到key-ego变换
+            sweep_intrin_mats.append(torch.stack(intrin_mats))          # 相机内参
+            sweep_ida_mats.append(torch.stack(ida_mats))                # ida矩阵
+            sweep_sensor2sensor_mats.append(torch.stack(sensor2sensor_mats))    # sweep传感器到key传感器的变换
+            sweep_timestamps.append(torch.tensor(timestamps))           # sweep的时间戳
             if self.return_depth:
                 sweep_lidar_depth.append(torch.stack(lidar_depth))
         # Get mean pose of all cams.
@@ -536,7 +565,18 @@ class NuscDetDataset(Dataset):
         ]
         if self.return_depth:
             ret_list.append(torch.stack(sweep_lidar_depth).permute(1, 0, 2, 3))
-        return ret_list
+        ida_dicts = {
+            'cam_resize':cam_resize,
+            'cam_resize_dims':cam_resize_dims,
+            'cam_crop':cam_crop,
+            'cam_flip':cam_flip, 
+            'cam_rotate_ida':cam_rotate_ida,
+        }
+        data_dicts = {
+            'ret_list':ret_list,
+            'ida_dicts':ida_dicts
+        }
+        return data_dicts
 
     def get_gt(self, info, cams):
         """Generate gt labels from info.
@@ -600,6 +640,98 @@ class NuscDetDataset(Dataset):
             cams = self.ida_aug_conf['cams']
         return cams
 
+    def _2d_mask_transform(self, mask, resize_dims, crop, flip, rotate_ida):
+        mask = cv2.resize(mask, resize_dims, interpolation=cv2.INTER_AREA)
+
+        mask = robust_crop_img(mask, crop)
+        if flip:
+            mask = cv2.flip(mask, flipCode=1)
+        h, w = mask.shape[:2]
+        M = cv2.getRotationMatrix2D(center=(w // 2, h // 2), angle=rotate_ida, scale=1.0)
+        mask = cv2.warpAffine(mask, M, (w, h))
+        mask = np.array(mask)
+        return mask
+    
+    def get_2d_masks(self, gt_boxes, gt_labels, cams, extrinsics, intrinsics, ida_mats):
+        '''
+        Args:
+            gt_boxes: 3D annotation.
+            gt_labels: class label.
+            cams: camera names.
+            extrinsics: inversed extrinsics. # (n, 4, 4)
+        Return:
+            masks_2d: masks and height of foreground.
+        '''
+        masks_2d = []
+        h, w = 900, 1600
+        (cam_resize, 
+         cam_resize_dims, 
+         cam_crop, 
+         cam_flip, 
+         cam_rotate_ida
+         ) = (ida_mats['cam_resize'],
+              ida_mats['cam_resize_dims'],
+              ida_mats['cam_crop'],
+              ida_mats['cam_flip'],
+              ida_mats['cam_rotate_ida'],)
+        inv = np.linalg.inv
+
+
+        # 针对每个相机计算投影
+        for index, cam in enumerate(cams):
+            extrinsic = inv(extrinsics[index]) # ego2camera
+            intrinsic = intrinsics[index][:3,:3]
+            mask = np.zeros((h,w), np.uint8)
+            resize, resize_dims, crop, flip, rotate_ida = \
+                cam_resize[index], cam_resize_dims[index], cam_crop[index], cam_flip[index], cam_rotate_ida[index]
+
+            for bbox, label in zip(gt_boxes, gt_labels):
+                # filter no need label
+                center = bbox[0:3]
+                dim = bbox[3:6]
+                yaw = np.zeros(3)
+                yaw[2] = bbox[6]
+                rot_mat = geometry.get_rotation_matrix_from_xyz(yaw)
+                box3d = geometry.OrientedBoundingBox(center, rot_mat, dim)
+                box3d.color = np.clip(box3d.color, 0, 1)
+                line_set = geometry.LineSet.create_from_oriented_bounding_box(box3d)
+                vertex = np.array(line_set.points)
+                p = np.dot(extrinsic, np.c_[vertex, np.ones(len(vertex))].T).T
+                if all(p[:, 2] <= 0):
+                    continue
+                p = p[:, :3] / p[:, 3:4]
+                pts = p.reshape(-1, 1, 3)
+
+                lines_3d = []
+                for x, y in np.array(line_set.lines):
+                    line = np.stack([pts[x, 0], pts[y, 0]])
+                    lines_3d.append(line)
+
+                real_lines = []
+                for line in lines_3d:
+                    if all(line[:, -1] > 0):
+                        line, _ = cv2.projectPoints(line, np.zeros(3), np.zeros(3), intrinsic.numpy(), np.zeros(5))
+                        real_lines.append(line[:, 0])
+                    elif any(line[:, -1] > 0):
+                        interpolate = (0.001 - line[line[:, -1] <= 0][0, -1]) / (
+                            line[line[:, -1] > 0][0, -1] - line[line[:, -1] <= 0][0, -1]
+                        )
+                        line[line[:, -1] <= 0] = (
+                            interpolate * (line[line[:, -1] > 0] - line[line[:, -1] <= 0]) + line[line[:, -1] <= 0]
+                        )
+                        line, _ = cv2.projectPoints(line, np.zeros(3), np.zeros(3), intrinsic.numpy(), np.zeros(5))
+                        real_lines.append(line[:, 0])
+
+                lt = np.array([np.vstack(real_lines)[:, 0].min(), np.vstack(real_lines)[:, 1].min()]).astype(int)
+                rb = np.array([np.vstack(real_lines)[:, 0].max(), np.vstack(real_lines)[:, 1].max()]).astype(int)
+                x1, y1, x2, y2 = lt[0], lt[1], rb[0], rb[1]
+                x1, y1 = min(w, max(0, x1)), min(h, max(0, y1))
+                x2, y2 = max(0, min(x2, w)), max(0, min(h, y2))
+                mask[y1:y2, x1:x2] = 1
+            mask = self._2d_mask_transform(mask, resize_dims=resize_dims, crop=crop, flip=flip, rotate_ida=rotate_ida)
+            masks_2d.append(torch.from_numpy(mask))
+        return torch.stack(masks_2d)
+        
     def __getitem__(self, idx):
         if self.use_cbgs:
             idx = self.sample_indices[idx]
@@ -645,10 +777,13 @@ class NuscDetDataset(Dataset):
                             lidar_infos.append(info['lidar_sweeps'][lidar_idx])
                             break
         if self.return_depth or self.use_fusion:
-            image_data_list = self.get_image(cam_infos, cams, lidar_infos)
-
+            data_dicts = self.get_image(cam_infos, cams, lidar_infos)
         else:
-            image_data_list = self.get_image(cam_infos, cams)
+            data_dicts = self.get_image(cam_infos, cams)
+        
+        image_data_list = data_dicts['ret_list']
+        ida_dicts = data_dicts['ida_dicts']
+
         ret_list = list()
         (
             sweep_imgs,
@@ -662,6 +797,8 @@ class NuscDetDataset(Dataset):
         img_metas['token'] = self.infos[idx]['sample_token']
         if self.is_train:
             gt_boxes, gt_labels = self.get_gt(self.infos[idx], cams)
+            # 只生成关键帧的mask
+            masks_2d = self.get_2d_masks(gt_boxes, gt_labels, cams, sweep_sensor2ego_mats[0], sweep_intrins[0], ida_dicts)
         # Temporary solution for test.
         else:
             gt_boxes = sweep_imgs.new_zeros(0, 7)
@@ -688,6 +825,7 @@ class NuscDetDataset(Dataset):
         ]
         if self.return_depth:
             ret_list.append(image_data_list[7])
+            ret_list.append(masks_2d)
         return ret_list
 
     def __str__(self):
@@ -714,6 +852,7 @@ def collate_fn(data, is_return_depth=False):
     gt_labels_batch = list()
     img_metas_batch = list()
     depth_labels_batch = list()
+    masks_2d_batch = list()
     for iter_data in data:
         (
             sweep_imgs,
@@ -730,6 +869,7 @@ def collate_fn(data, is_return_depth=False):
         if is_return_depth:
             gt_depth = iter_data[10]
             depth_labels_batch.append(gt_depth)
+            masks_2d_batch.append(iter_data[-1])
         imgs_batch.append(sweep_imgs)
         sensor2ego_mats_batch.append(sweep_sensor2ego_mats)
         intrin_mats_batch.append(sweep_intrins)
@@ -756,4 +896,5 @@ def collate_fn(data, is_return_depth=False):
     ]
     if is_return_depth:
         ret_list.append(torch.stack(depth_labels_batch))
+        ret_list.append(torch.stack(masks_2d_batch))
     return ret_list

@@ -217,3 +217,11 @@ events.out.tfevents*
 
 # vim
 .vim
+
+# data mmdet3d
+data/
+mmdetection3d/
+
+*.png
+test/
+.github/
