@@ -239,14 +239,7 @@ class BEVDepthLightningModel(LightningModule):
         return self.model(sweep_imgs, mats)
 
     def training_step(self, batch):
-        (sweep_imgs, mats, _, _, gt_boxes, gt_labels, depth_labels, masks_2d) = batch
-        data = {
-            'imgs':sweep_imgs.cpu().numpy(),
-            'masks_2d':masks_2d.cpu().numpy()
-        }
-        path = '/home/yhzn/xiaohuahui/BEVDepth/vis'
-        mmcv.dump(data,f'{path}/data.pkl')
-        exit()
+        (sweep_imgs, mats, _, _, gt_boxes, gt_labels, depth_labels) = batch
 
         if torch.cuda.is_available():
             for key, value in mats.items():
@@ -401,12 +394,12 @@ class BEVDepthLightningModel(LightningModule):
                                        key_idxes=self.key_idxes,
                                        return_depth=self.data_return_depth,
                                        use_fusion=self.use_fusion,
-                                       imnormalize=False)
+                                       imnormalize=True)
 
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=self.batch_size_per_device,
-            num_workers=1,
+            num_workers=4,
             drop_last=True,
             shuffle=False,
             collate_fn=partial(collate_fn,

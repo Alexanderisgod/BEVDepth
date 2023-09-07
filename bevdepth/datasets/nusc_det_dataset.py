@@ -12,6 +12,7 @@ from torch.utils.data import Dataset
 
 from open3d import geometry
 import cv2
+from bevdepth.utils.height_draw import draw_heatmap, get_coord, img_pe
 
 __all__ = ['NuscDetDataset']
 
@@ -253,7 +254,7 @@ class NuscDetDataset(Dataset):
                  key_idxes=list(),
                  use_fusion=False,
                  imnormalize=True,
-                 return_mask2d=True):
+                 return_mask2d=False):
         """Dataset used for bevdetection task.
         Args:
             ida_aug_conf (dict): Config for ida augmentation.
@@ -679,14 +680,17 @@ class NuscDetDataset(Dataset):
 
         # 针对每个相机计算投影
         for index, cam in enumerate(cams):
-            extrinsic = inv(extrinsics[index]) # ego2camera
-            intrinsic = intrinsics[index][:3,:3]
-            mask = np.zeros((h,w), np.uint8)
+            extrinsic = inv(extrinsics[index].numpy()) # ego2camera
+            intrinsic = intrinsics[index].numpy()
+            mask = np.zeros((h,w), np.float32)
             resize, resize_dims, crop, flip, rotate_ida = \
                 cam_resize[index], cam_resize_dims[index], cam_crop[index], cam_flip[index], cam_rotate_ida[index]
 
             for bbox, label in zip(gt_boxes, gt_labels):
-                # filter no need label
+                # cal center point projection
+                obj_center = intrinsic@extrinsic@np.array((*bbox[0:3,], 1))
+                obj_center[:2] /= obj_center[2]
+
                 center = bbox[0:3]
                 dim = bbox[3:6]
                 yaw = np.zeros(3)
@@ -710,7 +714,7 @@ class NuscDetDataset(Dataset):
                 real_lines = []
                 for line in lines_3d:
                     if all(line[:, -1] > 0):
-                        line, _ = cv2.projectPoints(line, np.zeros(3), np.zeros(3), intrinsic.numpy(), np.zeros(5))
+                        line, _ = cv2.projectPoints(line, np.zeros(3), np.zeros(3), intrinsic[:3,:3], np.zeros(5))
                         real_lines.append(line[:, 0])
                     elif any(line[:, -1] > 0):
                         interpolate = (0.001 - line[line[:, -1] <= 0][0, -1]) / (
@@ -719,7 +723,7 @@ class NuscDetDataset(Dataset):
                         line[line[:, -1] <= 0] = (
                             interpolate * (line[line[:, -1] > 0] - line[line[:, -1] <= 0]) + line[line[:, -1] <= 0]
                         )
-                        line, _ = cv2.projectPoints(line, np.zeros(3), np.zeros(3), intrinsic.numpy(), np.zeros(5))
+                        line, _ = cv2.projectPoints(line, np.zeros(3), np.zeros(3), intrinsic[:3,:3], np.zeros(5))
                         real_lines.append(line[:, 0])
 
                 lt = np.array([np.vstack(real_lines)[:, 0].min(), np.vstack(real_lines)[:, 1].min()]).astype(int)
@@ -727,7 +731,32 @@ class NuscDetDataset(Dataset):
                 x1, y1, x2, y2 = lt[0], lt[1], rb[0], rb[1]
                 x1, y1 = min(w, max(0, x1)), min(h, max(0, y1))
                 x2, y2 = max(0, min(x2, w)), max(0, min(h, y2))
-                mask[y1:y2, x1:x2] = 1
+                # mask[y1:y2, x1:x2] = 1
+
+                # img plane 2D h,w 
+                width = abs(x2-x1)
+                x, y = obj_center[:2]
+                if x>=0 and x<w and y>=0 and y<h:
+                    cv2.circle(mask, (int(x), int(y)), 4, (255, 0, 0))
+                    cv2.circle(mask, (int(x+width/4), int(y)), 4, (255, 0, 0))
+                    cv2.circle(mask, (int(x-width/4), int(y)), 4, (255, 0, 0))
+
+                # draw height heatmaps
+                coords = get_coord(np.array(center), dim) # (N, 3)
+                if len(coords)==0: continue
+                coords = intrinsic@extrinsic@(np.c_[coords, np.ones(coords.shape[0])].T)
+                coords = coords.T # (4, N) -> (N, 4)
+                coords[:, :2] /= coords[:, 2]
+                height = abs(coords[1, 1]-coords[0, 1])
+                for coord in coords:
+                    x, y = coord[:2]
+                    if x>=0 and x<w and y>=0 and y<h:
+                        cv2.circle(mask, (int(x), int(y)), 4, (0, 255, 0))
+                        mask = torch.from_numpy(mask)
+                        mask = draw_heatmap(mask, (int(x), int(y)), radius_x=int(width//4), radius_y=int(height//4))
+                        mask = mask.numpy()
+            mask_pe = img_pe(h, w)
+            mask = np.concatenate((mask[..., None], mask_pe), axis=-1)
             mask = self._2d_mask_transform(mask, resize_dims=resize_dims, crop=crop, flip=flip, rotate_ida=rotate_ida)
             masks_2d.append(torch.from_numpy(mask))
         return torch.stack(masks_2d)
@@ -797,12 +826,13 @@ class NuscDetDataset(Dataset):
         img_metas['token'] = self.infos[idx]['sample_token']
         if self.is_train:
             gt_boxes, gt_labels = self.get_gt(self.infos[idx], cams)
-            # 只生成关键帧的mask
-            masks_2d = self.get_2d_masks(gt_boxes, gt_labels, cams, sweep_sensor2ego_mats[0], sweep_intrins[0], ida_dicts)
         # Temporary solution for test.
         else:
             gt_boxes = sweep_imgs.new_zeros(0, 7)
             gt_labels = sweep_imgs.new_zeros(0, )
+        # 只生成关键帧的mask
+        if self.return_mask2d:
+            masks_2d = self.get_2d_masks(gt_boxes, gt_labels, cams, sweep_sensor2ego_mats[0], sweep_intrins[0], ida_dicts)
 
         rotate_bda, scale_bda, flip_dx, flip_dy = self.sample_bda_augmentation(
         )
@@ -825,6 +855,7 @@ class NuscDetDataset(Dataset):
         ]
         if self.return_depth:
             ret_list.append(image_data_list[7])
+        if self.return_mask2d:
             ret_list.append(masks_2d)
         return ret_list
 
@@ -840,7 +871,7 @@ class NuscDetDataset(Dataset):
             return len(self.infos)
 
 
-def collate_fn(data, is_return_depth=False):
+def collate_fn(data, is_return_depth=False, is_return_mask2d=False):
     imgs_batch = list()
     sensor2ego_mats_batch = list()
     intrin_mats_batch = list()
@@ -869,6 +900,7 @@ def collate_fn(data, is_return_depth=False):
         if is_return_depth:
             gt_depth = iter_data[10]
             depth_labels_batch.append(gt_depth)
+        if is_return_mask2d:
             masks_2d_batch.append(iter_data[-1])
         imgs_batch.append(sweep_imgs)
         sensor2ego_mats_batch.append(sweep_sensor2ego_mats)
@@ -896,5 +928,6 @@ def collate_fn(data, is_return_depth=False):
     ]
     if is_return_depth:
         ret_list.append(torch.stack(depth_labels_batch))
+    if is_return_mask2d:
         ret_list.append(torch.stack(masks_2d_batch))
     return ret_list

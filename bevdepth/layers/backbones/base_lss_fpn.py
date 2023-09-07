@@ -14,7 +14,7 @@ try:
 except ImportError:
     print('Import VoxelPooling fail.')
 
-__all__ = ['BaseLSSFPN']
+__all__ = ['BaseLSSFPN', 'MaskLSSFPN']
 
 
 class _ASPPModule(nn.Module):
@@ -606,6 +606,266 @@ class BaseLSSFPN(nn.Module):
                     sweep_index,
                     sweep_imgs[:, sweep_index:sweep_index + 1, ...],
                     mats_dict,
+                    is_return_depth=False)
+                ret_feature_list.append(feature_map)
+
+        if is_return_depth:
+            return torch.cat(ret_feature_list, 1), key_frame_res[1]
+        else:
+            return torch.cat(ret_feature_list, 1)
+
+
+class MaskHeightDepthNet(DepthNet):
+
+    def __init__(self, in_channels, mid_channels, context_channels,
+                 depth_channels):
+        super().__init__(in_channels, mid_channels, context_channels,
+                         depth_channels)
+        self.mid_channels = mid_channels
+        
+        # mask conv
+        self.mask_channels = 3
+        self.mask_mid_channels = 32
+        H, W = 16, 44
+        self.mask_conv = nn.Sequential(
+            nn.Conv2d(self.mask_channels,
+                      self.mask_mid_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0),
+            # nn.BatchNorm2d(self.mask_mid_channels),
+            nn.LayerNorm([self.mask_mid_channels, H, W]), # 使用layer_norm替换
+            nn.ReLU(inplace=True),
+            BasicBlock(self.mask_mid_channels, self.mask_mid_channels),
+            nn.Conv2d(self.mask_mid_channels,
+                      self.mask_mid_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0),)
+        self.mask_mlp = Mlp(27, self.mask_mid_channels, self.mask_mid_channels)
+        self.mask_se = SELayer(self.mask_mid_channels)
+
+        self.mask_fusion = nn.Sequential(
+            nn.Conv2d(self.mask_mid_channels+self.mid_channels,
+                      self.mid_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0),
+            nn.BatchNorm2d(self.mid_channels),
+            nn.ReLU(inplace=True),
+            BasicBlock(self.mid_channels, self.mid_channels),
+            nn.Conv2d(self.mid_channels,
+                      self.mid_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0),)
+
+
+    def forward(self, x, mats_dict, masks_2d):
+        intrins = mats_dict['intrin_mats'][:, 0:1, ..., :3, :3]
+        batch_size = intrins.shape[0]
+        num_cams = intrins.shape[2]
+        ida = mats_dict['ida_mats'][:, 0:1, ...]
+        sensor2ego = mats_dict['sensor2ego_mats'][:, 0:1, ..., :3, :]
+        bda = mats_dict['bda_mat'].view(batch_size, 1, 1, 4,
+                                        4).repeat(1, 1, num_cams, 1, 1)
+        mlp_input = torch.cat(
+            [
+                torch.stack(
+                    [
+                        intrins[:, 0:1, ..., 0, 0],
+                        intrins[:, 0:1, ..., 1, 1],
+                        intrins[:, 0:1, ..., 0, 2],
+                        intrins[:, 0:1, ..., 1, 2],
+                        ida[:, 0:1, ..., 0, 0],
+                        ida[:, 0:1, ..., 0, 1],
+                        ida[:, 0:1, ..., 0, 3],
+                        ida[:, 0:1, ..., 1, 0],
+                        ida[:, 0:1, ..., 1, 1],
+                        ida[:, 0:1, ..., 1, 3],
+                        bda[:, 0:1, ..., 0, 0],
+                        bda[:, 0:1, ..., 0, 1],
+                        bda[:, 0:1, ..., 1, 0],
+                        bda[:, 0:1, ..., 1, 1],
+                        bda[:, 0:1, ..., 2, 2],
+                    ],
+                    dim=-1,
+                ),
+                sensor2ego.view(batch_size, 1, num_cams, -1),
+            ],
+            -1,
+        )
+        mlp_input = self.bn(mlp_input.reshape(-1, mlp_input.shape[-1]))
+        x = self.reduce_conv(x)
+        context_se = self.context_mlp(mlp_input)[..., None, None]
+        context = self.context_se(x, context_se)
+        context = self.context_conv(context)
+        
+        B, N, C, H, W = masks_2d.shape
+        masks_2d = masks_2d.view(B*N, C, H, W)
+        mask = self.mask_conv(masks_2d)
+        mask_se = self.mask_mlp(mlp_input)[..., None, None]
+        mask = self.mask_se(mask, mask_se)
+
+        depth_se = self.depth_mlp(mlp_input)[..., None, None]
+        depth = self.depth_se(x, depth_se)
+        # 融合高度mask引导
+        depth = self.mask_fusion(torch.cat((depth, mask), dim=1))
+        depth = self.depth_conv(depth)
+
+        return torch.cat([depth, context], dim=1)
+
+class MaskLSSFPN(BaseLSSFPN):
+    
+    def _configure_depth_net(self, depth_net_conf):
+        return MaskHeightDepthNet(
+            depth_net_conf['in_channels'],
+            depth_net_conf['mid_channels'],
+            self.output_channels,
+            self.depth_channels,
+        )
+    
+    def _forward_depth_net(self, feat, mats_dict, masks_2d):
+        return self.depth_net(feat, mats_dict, masks_2d)
+
+    def _forward_single_sweep(self,
+                              sweep_index,
+                              sweep_imgs,
+                              mats_dict,
+                              masks_2d,
+                              is_return_depth=False):
+        """Forward function for single sweep.
+
+        Args:
+            sweep_index (int): Index of sweeps.
+            sweep_imgs (Tensor): Input images.
+            mats_dict (dict):
+                sensor2ego_mats(Tensor): Transformation matrix from
+                    camera to ego with shape of (B, num_sweeps,
+                    num_cameras, 4, 4).
+                intrin_mats(Tensor): Intrinsic matrix with shape
+                    of (B, num_sweeps, num_cameras, 4, 4).
+                ida_mats(Tensor): Transformation matrix for ida with
+                    shape of (B, num_sweeps, num_cameras, 4, 4).
+                sensor2sensor_mats(Tensor): Transformation matrix
+                    from key frame camera to sweep frame camera with
+                    shape of (B, num_sweeps, num_cameras, 4, 4).
+                bda_mat(Tensor): Rotation matrix for bda with shape
+                    of (B, 4, 4).
+            is_return_depth (bool, optional): Whether to return depth.
+                Default: False.
+
+        Returns:
+            Tensor: BEV feature map.
+        """
+        batch_size, num_sweeps, num_cams, num_channels, img_height, \
+            img_width = sweep_imgs.shape
+        img_feats = self.get_cam_feats(sweep_imgs)
+        source_features = img_feats[:, 0, ...]
+        depth_feature = self._forward_depth_net(
+            source_features.reshape(batch_size * num_cams,
+                                    source_features.shape[2],
+                                    source_features.shape[3],
+                                    source_features.shape[4]),
+            mats_dict,
+            masks_2d,
+        )
+        depth = depth_feature[:, :self.depth_channels].softmax(
+            dim=1, dtype=depth_feature.dtype)
+        geom_xyz = self.get_geometry(
+            mats_dict['sensor2ego_mats'][:, sweep_index, ...],
+            mats_dict['intrin_mats'][:, sweep_index, ...],
+            mats_dict['ida_mats'][:, sweep_index, ...],
+            mats_dict.get('bda_mat', None),
+        )
+        geom_xyz = ((geom_xyz - (self.voxel_coord - self.voxel_size / 2.0)) /
+                    self.voxel_size).int()
+        if self.training or self.use_da:
+            img_feat_with_depth = depth.unsqueeze(
+                1) * depth_feature[:, self.depth_channels:(
+                    self.depth_channels + self.output_channels)].unsqueeze(2)
+
+            img_feat_with_depth = self._forward_voxel_net(img_feat_with_depth)
+
+            img_feat_with_depth = img_feat_with_depth.reshape(
+                batch_size,
+                num_cams,
+                img_feat_with_depth.shape[1],
+                img_feat_with_depth.shape[2],
+                img_feat_with_depth.shape[3],
+                img_feat_with_depth.shape[4],
+            )
+
+            img_feat_with_depth = img_feat_with_depth.permute(0, 1, 3, 4, 5, 2)
+
+            feature_map = voxel_pooling_train(geom_xyz,
+                                              img_feat_with_depth.contiguous(),
+                                              self.voxel_num.cuda())
+        else:
+            feature_map = voxel_pooling_inference(
+                geom_xyz, depth, depth_feature[:, self.depth_channels:(
+                    self.depth_channels + self.output_channels)].contiguous(),
+                self.voxel_num.cuda())
+        if is_return_depth:
+            # final_depth has to be fp32, otherwise the depth
+            # loss will colapse during the traing process.
+            return feature_map.contiguous(
+            ), depth_feature[:, :self.depth_channels].softmax(dim=1)
+        return feature_map.contiguous()
+
+    def forward(self,
+                sweep_imgs,
+                mats_dict,
+                masks_2d,
+                timestamps=None,
+                is_return_depth=False):
+        """Forward function.
+
+        Args:
+            sweep_imgs(Tensor): Input images with shape of (B, num_sweeps,
+                num_cameras, 3, H, W).
+            mats_dict(dict):
+                sensor2ego_mats(Tensor): Transformation matrix from
+                    camera to ego with shape of (B, num_sweeps,
+                    num_cameras, 4, 4).
+                intrin_mats(Tensor): Intrinsic matrix with shape
+                    of (B, num_sweeps, num_cameras, 4, 4).
+                ida_mats(Tensor): Transformation matrix for ida with
+                    shape of (B, num_sweeps, num_cameras, 4, 4).
+                sensor2sensor_mats(Tensor): Transformation matrix
+                    from key frame camera to sweep frame camera with
+                    shape of (B, num_sweeps, num_cameras, 4, 4).
+                bda_mat(Tensor): Rotation matrix for bda with shape
+                    of (B, 4, 4).
+            timestamps(Tensor): Timestamp for all images with the shape of(B,
+                num_sweeps, num_cameras).
+
+        Return:
+            Tensor: bev feature map.
+        """
+        batch_size, num_sweeps, num_cams, num_channels, img_height, \
+            img_width = sweep_imgs.shape
+
+        key_frame_res = self._forward_single_sweep(
+            0,
+            sweep_imgs[:, 0:1, ...],
+            mats_dict,
+            masks_2d,
+            is_return_depth=is_return_depth)
+        if num_sweeps == 1:
+            return key_frame_res
+
+        key_frame_feature = key_frame_res[
+            0] if is_return_depth else key_frame_res
+
+        ret_feature_list = [key_frame_feature]
+        for sweep_index in range(1, num_sweeps):
+            with torch.no_grad():
+                feature_map = self._forward_single_sweep(
+                    sweep_index,
+                    sweep_imgs[:, sweep_index:sweep_index + 1, ...],
+                    mats_dict,
+                    masks_2d,
                     is_return_depth=False)
                 ret_feature_list.append(feature_map)
 
