@@ -626,34 +626,31 @@ class MaskHeightDepthNet(DepthNet):
         # mask conv
         self.mask_channels = 3
         self.mask_mid_channels = 32
-        H, W = 16, 44
         self.mask_conv = nn.Sequential(
             nn.Conv2d(self.mask_channels,
                       self.mask_mid_channels,
-                      kernel_size=1,
+                      kernel_size=3,
                       stride=1,
-                      padding=0),
-            # nn.BatchNorm2d(self.mask_mid_channels),
-            nn.LayerNorm([self.mask_mid_channels, H, W]), # 使用layer_norm替换
+                      padding=1),
+            nn.BatchNorm2d(self.mask_mid_channels),
             nn.ReLU(inplace=True),
             BasicBlock(self.mask_mid_channels, self.mask_mid_channels),
             nn.Conv2d(self.mask_mid_channels,
-                      self.mask_mid_channels,
+                      self.mask_mid_channels*2,
                       kernel_size=1,
                       stride=1,
                       padding=0),)
-        self.mask_mlp = Mlp(27, self.mask_mid_channels, self.mask_mid_channels)
-        self.mask_se = SELayer(self.mask_mid_channels)
+        self.mask_mlp = Mlp(27, self.mask_mid_channels*2, self.mask_mid_channels*2)
+        self.mask_se = SELayer(self.mask_mid_channels*2)
 
         self.mask_fusion = nn.Sequential(
-            nn.Conv2d(self.mask_mid_channels+self.mid_channels,
+            nn.Conv2d(self.mask_mid_channels*2+self.mid_channels,
                       self.mid_channels,
-                      kernel_size=1,
+                      kernel_size=3,
                       stride=1,
-                      padding=0),
+                      padding=1),
             nn.BatchNorm2d(self.mid_channels),
             nn.ReLU(inplace=True),
-            BasicBlock(self.mid_channels, self.mid_channels),
             nn.Conv2d(self.mid_channels,
                       self.mid_channels,
                       kernel_size=1,
@@ -706,11 +703,11 @@ class MaskHeightDepthNet(DepthNet):
         mask = self.mask_conv(masks_2d)
         mask_se = self.mask_mlp(mlp_input)[..., None, None]
         mask = self.mask_se(mask, mask_se)
+        # 融合高度mask引导
+        x = self.mask_fusion(torch.cat((x, mask), dim=1))
 
         depth_se = self.depth_mlp(mlp_input)[..., None, None]
         depth = self.depth_se(x, depth_se)
-        # 融合高度mask引导
-        depth = self.mask_fusion(torch.cat((depth, mask), dim=1))
         depth = self.depth_conv(depth)
 
         return torch.cat([depth, context], dim=1)

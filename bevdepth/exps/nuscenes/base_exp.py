@@ -259,8 +259,8 @@ class BEVDepthLightningModel(LightningModule):
             # only key-frame will calculate depth loss
             depth_labels = depth_labels[:, 0, ...]
         depth_loss = self.get_depth_loss(depth_labels.cuda(), depth_preds)
-        self.log('detection_loss', detection_loss)
-        self.log('depth_loss', depth_loss)
+        self.log('detection_loss', detection_loss, on_step=True, prog_bar=True)
+        self.log('depth_loss', depth_loss, on_step=True, prog_bar=True)
         return detection_loss + depth_loss
 
     def get_depth_loss(self, depth_labels, depth_preds):

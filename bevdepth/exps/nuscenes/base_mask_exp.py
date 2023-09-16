@@ -19,6 +19,8 @@ class BEVDepthLightningModel(BaseBEVDepthLightningModel):
     def training_step(self, batch):
         (sweep_imgs, mats, _, _, gt_boxes, gt_labels, depth_labels, masks_2d) = batch
         
+        # import mmcv
+        # import numpy as np
         # data = {
         #     'imgs':sweep_imgs.cpu().numpy(),
         #     'masks_2d':masks_2d.cpu().numpy()
@@ -48,8 +50,8 @@ class BEVDepthLightningModel(BaseBEVDepthLightningModel):
             # only key-frame will calculate depth loss
             depth_labels = depth_labels[:, 0, ...]
         depth_loss = self.get_depth_loss(depth_labels.cuda(), depth_preds)
-        self.log('detection_loss', detection_loss)
-        self.log('depth_loss', depth_loss)
+        self.log('detection_loss', detection_loss, on_step=True, prog_bar=True)
+        self.log('depth_loss', depth_loss, on_step=True, prog_bar=True)
         return detection_loss + depth_loss
     
     def eval_step(self, batch, batch_idx, prefix: str):

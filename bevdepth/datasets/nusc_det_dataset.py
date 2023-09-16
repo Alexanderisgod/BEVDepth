@@ -653,7 +653,7 @@ class NuscDetDataset(Dataset):
         mask = np.array(mask)
         return mask
     
-    def get_2d_masks(self, gt_boxes, gt_labels, cams, extrinsics, intrinsics, ida_mats):
+    def get_2d_masks(self, gt_boxes, cams, extrinsics, intrinsics, ida_mats):
         '''
         Args:
             gt_boxes: 3D annotation.
@@ -686,7 +686,7 @@ class NuscDetDataset(Dataset):
             resize, resize_dims, crop, flip, rotate_ida = \
                 cam_resize[index], cam_resize_dims[index], cam_crop[index], cam_flip[index], cam_rotate_ida[index]
 
-            for bbox, label in zip(gt_boxes, gt_labels):
+            for bbox in gt_boxes:
                 # cal center point projection
                 obj_center = intrinsic@extrinsic@np.array((*bbox[0:3,], 1))
                 obj_center[:2] /= obj_center[2]
@@ -735,28 +735,29 @@ class NuscDetDataset(Dataset):
 
                 # img plane 2D h,w 
                 width = abs(x2-x1)
-                x, y = obj_center[:2]
-                if x>=0 and x<w and y>=0 and y<h:
-                    cv2.circle(mask, (int(x), int(y)), 4, (255, 0, 0))
-                    cv2.circle(mask, (int(x+width/4), int(y)), 4, (255, 0, 0))
-                    cv2.circle(mask, (int(x-width/4), int(y)), 4, (255, 0, 0))
+                # x, y = obj_center[:2]
+                # if x>=0 and x<w and y>=0 and y<h:
+                #     cv2.circle(mask, (int(x), int(y)), 4, (255, 0, 0))
+                #     cv2.circle(mask, (int(x+width/4), int(y)), 4, (255, 0, 0))
+                #     cv2.circle(mask, (int(x-width/4), int(y)), 4, (255, 0, 0))
 
                 # draw height heatmaps
                 coords = get_coord(np.array(center), dim) # (N, 3)
                 if len(coords)==0: continue
                 coords = intrinsic@extrinsic@(np.c_[coords, np.ones(coords.shape[0])].T)
                 coords = coords.T # (4, N) -> (N, 4)
-                coords[:, :2] /= coords[:, 2]
-                height = abs(coords[1, 1]-coords[0, 1])
-                for coord in coords:
+                coords[:, :2] /= coords[:, 2:3]
+                height = abs(coords[0, 1]-coords[2, 1])
+                for index, coord in enumerate(coords):
                     x, y = coord[:2]
                     if x>=0 and x<w and y>=0 and y<h:
-                        cv2.circle(mask, (int(x), int(y)), 4, (0, 255, 0))
+                        # cv2.circle(mask, (int(x), int(y)), 4, (255, 0, 0))
                         mask = torch.from_numpy(mask)
-                        mask = draw_heatmap(mask, (int(x), int(y)), radius_x=int(width//4), radius_y=int(height//4))
+                        mask = draw_heatmap(mask, (int(x), int(y)), radius_x=int(width//4), radius_y=int(height//4), obj_h=(dim[2]).item()/4, index=index)
                         mask = mask.numpy()
-            mask_pe = img_pe(h, w)
-            mask = np.concatenate((mask[..., None], mask_pe), axis=-1)
+            # mask_pe = img_pe(h, w)
+            # mask = np.concatenate((mask[..., None], mask_pe), axis=-1)
+            mask = np.repeat(mask[..., None], 3, axis=-1)
             mask = self._2d_mask_transform(mask, resize_dims=resize_dims, crop=crop, flip=flip, rotate_ida=rotate_ida)
             masks_2d.append(torch.from_numpy(mask))
         return torch.stack(masks_2d)
@@ -832,7 +833,11 @@ class NuscDetDataset(Dataset):
             gt_labels = sweep_imgs.new_zeros(0, )
         # 只生成关键帧的mask
         if self.return_mask2d:
-            masks_2d = self.get_2d_masks(gt_boxes, gt_labels, cams, sweep_sensor2ego_mats[0], sweep_intrins[0], ida_dicts)
+            if self.is_train:
+                masks_2d = self.get_2d_masks(gt_boxes, cams, sweep_sensor2ego_mats[0], sweep_intrins[0], ida_dicts)
+            else:
+                boxes, _ = self.get_gt(self.infos[idx], cams)
+                masks_2d = self.get_2d_masks(boxes, cams, sweep_sensor2ego_mats[0], sweep_intrins[0], ida_dicts)
 
         rotate_bda, scale_bda, flip_dx, flip_dy = self.sample_bda_augmentation(
         )

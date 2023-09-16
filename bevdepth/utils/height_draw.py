@@ -20,16 +20,18 @@ def gaussian_2d(shape, sigma_x=1, sigma_y=1):
     h[h < np.finfo(h.dtype).eps * h.max()] = 0
     return h
 
-def evenly_H_2d(shape, x, y, height):
+def evenly_H_2d(shape, x, y, height, index):
     m, n = [(ss - 1.) / 2. for ss in shape]
-    y, x = np.ogrid[-m:m + 1, -n:n + 1]
+    m, n = max(1, m), max(1, n)
+    y, x = np.ogrid[-m:m + 1, -n:n + 1] # (-m, ...., m)
     
-    m, n = max(0.5, m), max(0.5, n)
-    y = height/(2*m)*(m-y-0.5)
+    y = height/(2*m+1)*(m-y+0.5)+index*height
+    # # 验证存粹mask的增益
+    # y = np.ones(y.shape)
     h = y.repeat(2*n+1, axis=1)
     return h
 
-def draw_heatmap(heatmap, center, radius_x, radius_y, k=1):
+def draw_heatmap(heatmap, center, radius_x, radius_y, obj_h=1, index=0, k=1):
     """Get masked heatmap.
 
     Args:
@@ -46,7 +48,7 @@ def draw_heatmap(heatmap, center, radius_x, radius_y, k=1):
     x, y = int(center[0]), int(center[1])
 
     # 均匀分布
-    gaussian = evenly_H_2d((diameter_y, diameter_x), x, y, 2)
+    gaussian = evenly_H_2d((diameter_y, diameter_x), x, y, obj_h, index)
 
     height, width = heatmap.shape[0:2]
 
@@ -69,17 +71,18 @@ def get_coord(center, dim):
         center: numpy of center point(x, y, z).
     '''
     l, w, h = dim
-    coords = center[None,...].repeat(2, 0)
+    coords = center[None,...].repeat(3, 0)
     if coords.shape[1]==0: return []
-    coords[0, 2] += h/4
-    coords[1, 2] -= h/4
+    coords[0, 2] -= h/4 # 下面点
+    coords[2, 2] += h/4 # 上面点
 
     return coords
 
 def img_pe(fH, fW):
-    x_coords = np.linspace(0.5, fW - .5, fW, dtype=np.float32)\
+    x_shift, y_shift = 1/(2*fW), 1/(2*fH)
+    x_coords = np.linspace(0, 1-x_shift, fW, dtype=np.float32)\
         .reshape(1, fW).repeat(fH, 0)
-    y_coords = np.linspace(0.5, fH - .5, fH, dtype=np.float32)\
+    y_coords = np.linspace(0, 1-y_shift, fH, dtype=np.float32)\
         .reshape(fH, 1).repeat(fW, 1)
 
     pe = np.stack((x_coords, y_coords), axis=-1)
