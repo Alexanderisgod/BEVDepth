@@ -31,7 +31,7 @@ def run_cli(model_class=BEVDepthLightningModel,
                                type=int,
                                default=0,
                                help='seed for initializing training.')
-    parent_parser.add_argument('--ckpt_path', type=str)
+    parent_parser.add_argument('--ckpt_path', default=None, type=str)
     parser = BEVDepthLightningModel.add_model_specific_args(parent_parser)
     parser.set_defaults(profiler='simple',
                         deterministic=False,
@@ -75,4 +75,7 @@ def run_cli(model_class=BEVDepthLightningModel,
         model.evaluator._format_bbox(all_pred_results, all_img_metas,
                                      os.path.dirname(args.ckpt_path))
     else:
-        trainer.fit(model)
+        if args.ckpt_path:
+            trainer.fit(model, ckpt_path=args.ckpt_path)
+        else:
+            trainer.fit(model)

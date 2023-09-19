@@ -20,18 +20,19 @@ def gaussian_2d(shape, sigma_x=1, sigma_y=1):
     h[h < np.finfo(h.dtype).eps * h.max()] = 0
     return h
 
-def evenly_H_2d(shape, x, y, height, index):
+def evenly_H_2d(shape, x, y, height, index, foreground_mask_only):
     m, n = [(ss - 1.) / 2. for ss in shape]
     m, n = max(1, m), max(1, n)
     y, x = np.ogrid[-m:m + 1, -n:n + 1] # (-m, ...., m)
     
     y = height/(2*m+1)*(m-y+0.5)+index*height
-    # # 验证存粹mask的增益
-    # y = np.ones(y.shape)
+    # 验证纯前景mask的增益
+    if foreground_mask_only:
+        y = np.ones(y.shape)
     h = y.repeat(2*n+1, axis=1)
     return h
 
-def draw_heatmap(heatmap, center, radius_x, radius_y, obj_h=1, index=0, k=1):
+def draw_heatmap(heatmap, center, radius_x, radius_y, obj_h=1, index=0, k=1, foreground_mask_only=True):
     """Get masked heatmap.
 
     Args:
@@ -48,7 +49,7 @@ def draw_heatmap(heatmap, center, radius_x, radius_y, obj_h=1, index=0, k=1):
     x, y = int(center[0]), int(center[1])
 
     # 均匀分布
-    gaussian = evenly_H_2d((diameter_y, diameter_x), x, y, obj_h, index)
+    gaussian = evenly_H_2d((diameter_y, diameter_x), x, y, obj_h, index, foreground_mask_only)
 
     height, width = heatmap.shape[0:2]
 

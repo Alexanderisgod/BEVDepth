@@ -254,7 +254,8 @@ class NuscDetDataset(Dataset):
                  key_idxes=list(),
                  use_fusion=False,
                  imnormalize=True,
-                 return_mask2d=False):
+                 return_mask2d=False,
+                 foreground_mask_only=True):
         """Dataset used for bevdetection task.
         Args:
             ida_aug_conf (dict): Config for ida augmentation.
@@ -306,6 +307,7 @@ class NuscDetDataset(Dataset):
         self.use_fusion = use_fusion
         self.imnormalize=imnormalize
         self.return_mask2d = return_mask2d
+        self.foreground_mask_only = foreground_mask_only
 
     def _get_sample_indices(self):
         """Load annotations from ann_file.
@@ -531,7 +533,7 @@ class NuscDetDataset(Dataset):
                     img = mmcv.imnormalize(np.array(img), self.img_mean,
                                         self.img_std, self.to_rgb)
                 else:
-                    img = np.array(img)
+                    img = np.array(img, dtype=np.float32)
                 img = torch.from_numpy(img).permute(2, 0, 1)
                 imgs.append(img)
                 intrin_mats.append(intrin_mat)
@@ -653,7 +655,7 @@ class NuscDetDataset(Dataset):
         mask = np.array(mask)
         return mask
     
-    def get_2d_masks(self, gt_boxes, cams, extrinsics, intrinsics, ida_mats):
+    def get_2d_masks(self, gt_boxes, cams, extrinsics, intrinsics, ida_mats, foreground_mask_only):
         '''
         Args:
             gt_boxes: 3D annotation.
@@ -753,11 +755,14 @@ class NuscDetDataset(Dataset):
                     if x>=0 and x<w and y>=0 and y<h:
                         # cv2.circle(mask, (int(x), int(y)), 4, (255, 0, 0))
                         mask = torch.from_numpy(mask)
-                        mask = draw_heatmap(mask, (int(x), int(y)), radius_x=int(width//4), radius_y=int(height//4), obj_h=(dim[2]).item()/4, index=index)
+                        mask = draw_heatmap(mask, (int(x), int(y)), radius_x=int(width//4), radius_y=int(height//4), 
+                                            obj_h=(dim[2]).item()/4, index=index, foreground_mask_only=foreground_mask_only)
                         mask = mask.numpy()
-            # mask_pe = img_pe(h, w)
-            # mask = np.concatenate((mask[..., None], mask_pe), axis=-1)
-            mask = np.repeat(mask[..., None], 3, axis=-1)
+            if foreground_mask_only:
+                mask = np.repeat(mask[..., None], 3, axis=-1)   # 只使用前景mask
+            else:
+                mask_pe = img_pe(h, w)                          # 高度mask + image PE 
+                mask = np.concatenate((mask[..., None], mask_pe), axis=-1)
             mask = self._2d_mask_transform(mask, resize_dims=resize_dims, crop=crop, flip=flip, rotate_ida=rotate_ida)
             masks_2d.append(torch.from_numpy(mask))
         return torch.stack(masks_2d)
@@ -834,10 +839,10 @@ class NuscDetDataset(Dataset):
         # 只生成关键帧的mask
         if self.return_mask2d:
             if self.is_train:
-                masks_2d = self.get_2d_masks(gt_boxes, cams, sweep_sensor2ego_mats[0], sweep_intrins[0], ida_dicts)
+                masks_2d = self.get_2d_masks(gt_boxes, cams, sweep_sensor2ego_mats[0], sweep_intrins[0], ida_dicts, self.foreground_mask_only)
             else:
                 boxes, _ = self.get_gt(self.infos[idx], cams)
-                masks_2d = self.get_2d_masks(boxes, cams, sweep_sensor2ego_mats[0], sweep_intrins[0], ida_dicts)
+                masks_2d = self.get_2d_masks(boxes, cams, sweep_sensor2ego_mats[0], sweep_intrins[0], ida_dicts, self.foreground_mask_only)
 
         rotate_bda, scale_bda, flip_dx, flip_dy = self.sample_bda_augmentation(
         )
