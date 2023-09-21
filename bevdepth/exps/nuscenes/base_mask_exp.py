@@ -354,25 +354,6 @@ class BEVDepthLightningModelPredHeight(BaseBEVDepthLightningModel):
         height_loss = F.binary_cross_entropy_with_logits(pred_height, gt_height.float())
         # print(f"height_loss:{torch.isnan(height_loss).any()}")
         return height_loss*2
-    
-    def eval_step(self, batch, batch_idx, prefix: str):
-        (sweep_imgs, mats, _, img_metas, _, _) = batch
-        
-        if torch.cuda.is_available():
-            for key, value in mats.items():
-                mats[key] = value.cuda()
-            sweep_imgs = sweep_imgs.cuda()
-        preds = self.model(sweep_imgs, mats)
-        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
-            results = self.model.module.get_bboxes(preds, img_metas)
-        else:
-            results = self.model.get_bboxes(preds, img_metas)
-        for i in range(len(results)):
-            results[i][0] = results[i][0].detach().cpu().numpy()
-            results[i][1] = results[i][1].detach().cpu().numpy()
-            results[i][2] = results[i][2].detach().cpu().numpy()
-            results[i].append(img_metas[i])
-        return results
 
     def train_dataloader(self):
         train_dataset = NuscDetDataset(ida_aug_conf=self.ida_aug_conf,
@@ -415,17 +396,18 @@ class BEVDepthLightningModelPredHeight(BaseBEVDepthLightningModel):
             sweep_imgs = sweep_imgs.cuda()
         preds, masks_pred, height = self.model(sweep_imgs, mats)
         
-        import mmcv
-        save_data = {
-            "imgs": sweep_imgs.cpu().numpy(),
-            "gt_mask": masks_2d.cpu().numpy(),
-            "pred_mask": masks_pred.cpu().numpy(),
-            "height": height.cpu().numpy(),
-        }
-        mmcv.dump(save_data, f"vis/height/mask{self.count}.pkl")
-        self.count += 1
-        if self.count>=4:
-            exit()
+        # import mmcv
+        # save_data = {
+        #     "imgs": sweep_imgs.cpu().numpy(),
+        #     "gt_mask": masks_2d.cpu().numpy(),
+        #     "pred_mask": masks_pred.cpu().numpy(),
+        #     "height": height.cpu().numpy(),
+        # }
+        # mmcv.dump(save_data, f"vis/height/mask{self.count}.pkl")
+        # self.count += 1
+        # if self.count>=4:
+        #     exit()
+        
         if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
             results = self.model.module.get_bboxes(preds, img_metas)
         else:
