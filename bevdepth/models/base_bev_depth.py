@@ -227,6 +227,7 @@ class MaskHeightBEVDepthPredHeight(BaseBEVDepth):
         self,
         x,
         mats_dict,
+        masks_pe,
         timestamps=None,
     ):
         """Forward function for BEVDepth
@@ -255,11 +256,12 @@ class MaskHeightBEVDepthPredHeight(BaseBEVDepth):
         if self.is_train_depth and self.training:
             x, depth_pred, mask_pred, height = self.backbone(x,
                                                              mats_dict,
+                                                             masks_pe,
                                                              timestamps,
                                                              is_return_depth=True)
             preds = self.head(x)
             return preds, depth_pred, mask_pred, height
         else:
-            x, depth_pred, mask_pred, height = self.backbone(x, mats_dict, timestamps, is_return_depth=True)
+            x, depth_pred, mask_pred, height = self.backbone(x, mats_dict,masks_pe, timestamps, is_return_depth=True)
             preds = self.head(x)
             return preds, mask_pred, height

@@ -14,6 +14,8 @@ try:
 except ImportError:
     print('Import VoxelPooling fail.')
 
+from bevdepth.utils.height_draw import img_pe
+
 __all__ = ['BaseLSSFPN', 'MaskLSSFPN']
 
 
@@ -878,7 +880,8 @@ class MaskHeightDepthNetPred_v0(MaskHeightDepthNet):
             depth_channels):
         super().__init__(in_channels, mid_channels, context_channels,
                         depth_channels)
-        self.mask_out_channes=2
+        self.mask_out_channels=2
+        self.pe_channel = 2
         
         self.mask_predict = nn.Sequential(
             nn.Conv2d(self.mid_channels,
@@ -889,13 +892,13 @@ class MaskHeightDepthNetPred_v0(MaskHeightDepthNet):
             nn.BatchNorm2d(self.mask_in_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(self.mask_in_channels,
-                      self.mask_out_channes,
+                      self.mask_out_channels,
                       kernel_size=1,
                       stride=1,
                       padding=0),)
         
         self.mask_conv = nn.Sequential(
-            nn.Conv2d(self.mask_out_channes,
+            nn.Conv2d(self.mask_out_channels+self.pe_channel,
                       self.mask_in_channels,
                       kernel_size=3,
                       stride=1,
@@ -969,7 +972,7 @@ class MaskHeightDepthNetPred(DepthNet):
             depth_channels):
         super().__init__(in_channels, mid_channels, context_channels,
                         depth_channels)
-        self.mask_out_channes=2
+        self.mask_out_channels=2
         self.height_mid_channels = 32
         self.mid_channels = mid_channels
         
@@ -983,7 +986,7 @@ class MaskHeightDepthNetPred(DepthNet):
             nn.BatchNorm2d(self.height_mid_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(self.height_mid_channels,
-                      self.mask_out_channes,
+                      self.mask_out_channels,
                       kernel_size=1,
                       stride=1,
                       padding=0),)
@@ -1203,10 +1206,29 @@ class MaskHeightDepthNetPredHeight_v0(MaskHeightDepthNetPred_v0):
         super().__init__(in_channels, mid_channels, context_channels,
                         depth_channels)
         # height discreate bins
+        self.height_in_channels = 128
         self.height_mid_channels = 64
         self.height_out_channels = 16
-        self.height_out_conv = nn.Sequential(
-            nn.Conv2d(self.mask_mid_channels,
+        
+        self.height_conv = nn.Sequential(
+            nn.Conv2d(self.mid_channels+self.pe_channel,
+                      self.height_in_channels,
+                      kernel_size=3,
+                      stride=1,
+                      padding=1),
+            nn.BatchNorm2d(self.height_in_channels),
+            nn.ReLU(inplace=True),
+            BasicBlock(self.height_in_channels, self.height_in_channels),
+            nn.Conv2d(self.height_in_channels,
+                      self.height_mid_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0),)
+        
+        self.height_mlp = Mlp(27, self.height_mid_channels, self.height_mid_channels)
+        self.height_se = SELayer(self.height_mid_channels)
+        self.height_predict = nn.Sequential(
+            nn.Conv2d(self.height_mid_channels,
                       self.height_mid_channels,
                       kernel_size=3,
                       stride=1,
@@ -1220,7 +1242,7 @@ class MaskHeightDepthNetPredHeight_v0(MaskHeightDepthNetPred_v0):
                       padding=0))
         
         self.height_fusion = nn.Sequential(
-            nn.Conv2d(self.mask_mid_channels+self.mid_channels,
+            nn.Conv2d(self.height_mid_channels+self.mid_channels,
                       self.mid_channels,
                       kernel_size=3,
                       stride=1,
@@ -1233,7 +1255,7 @@ class MaskHeightDepthNetPredHeight_v0(MaskHeightDepthNetPred_v0):
                       stride=1,
                       padding=0),)
 
-    def forward(self, x, mats_dict):
+    def forward(self, x, mats_dict, masks_pe):
         intrins = mats_dict['intrin_mats'][:, 0:1, ..., :3, :3]
         batch_size = intrins.shape[0]
         num_cams = intrins.shape[2]
@@ -1276,11 +1298,19 @@ class MaskHeightDepthNetPredHeight_v0(MaskHeightDepthNetPred_v0):
         
         # 预测mask
         mask_pred = self.mask_predict(x) # B*N, 512->16->2, H, W
-        mask = self.mask_conv(mask_pred) # B*N, 2->16->32, H, W
-        mask_se = self.mask_mlp(mlp_input)[..., None, None]
-        height = self.mask_se(mask, mask_se) # B*N, mask_mid_channels(32), H, W
         
-        height_bins = self.height_out_conv(height) # B*N, mask_mid_channels(32), H, W -> B*N, (64->16), H, W
+        # 预测高度
+        if masks_pe.dim()==5:
+            C, H, W = masks_pe.shape[-3:]
+            masks_pe = masks_pe.view(-1, C, H, W)
+        if masks_pe.shape[0]==1:
+            masks_pe = masks_pe.repeat(x.shape[0], 1, 1, 1)
+
+        height = torch.cat((x, masks_pe.to(x)), dim=1)
+        height = self.height_conv(height) # B*N, 512->128->64, H, W
+        height_se = self.height_mlp(mlp_input)[..., None, None]
+        height = self.height_se(height, height_se) # B*N, 64, H, W
+        height_bins = self.height_predict(height) # B*N, 64->16, H, W
 
         # 融合高度mask引导
         x = self.height_fusion(torch.cat((x, height), dim=1))
@@ -1397,6 +1427,16 @@ class MaskHeightDepthNetPredHeight(MaskHeightDepthNetPred):
     
 class MaskLSSFPNPredHeight(MaskLSSFPNPred):
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # img pe
+        start = self.downsample_factor//2
+        coord = img_pe(256, 704)[start::self.downsample_factor,start::self.downsample_factor]
+        coord = coord.transpose(2, 0, 1)
+        coord = coord[None,...] # 1, C, h, w
+        self.mask_pe = torch.Tensor(coord)
+    
     def _configure_depth_net(self, depth_net_conf):
         # return MaskHeightDepthNetPredHeight(
         #     depth_net_conf['in_channels'],
@@ -1410,11 +1450,15 @@ class MaskLSSFPNPredHeight(MaskLSSFPNPred):
             self.output_channels,
             self.depth_channels,
         )
-
+    
+    def _forward_depth_net(self, feat, mats_dict, mask_pe):
+        return self.depth_net(feat, mats_dict, mask_pe)
+    
     def _forward_single_sweep(self,
                               sweep_index,
                               sweep_imgs,
                               mats_dict,
+                              masks_pe,
                               is_return_depth=False):
         """Forward function for single sweep.
 
@@ -1450,6 +1494,7 @@ class MaskLSSFPNPredHeight(MaskLSSFPNPred):
                                     source_features.shape[3],
                                     source_features.shape[4]),
             mats_dict,
+            masks_pe,
         )
         depth = depth_feature[:, :self.depth_channels].softmax(
             dim=1, dtype=depth_feature.dtype)
@@ -1497,6 +1542,7 @@ class MaskLSSFPNPredHeight(MaskLSSFPNPred):
     def forward(self,
                 sweep_imgs,
                 mats_dict,
+                masks_pe=None,
                 timestamps=None,
                 is_return_depth=False):
         """Forward function.
@@ -1526,10 +1572,13 @@ class MaskLSSFPNPredHeight(MaskLSSFPNPred):
         batch_size, num_sweeps, num_cams, num_channels, img_height, \
             img_width = sweep_imgs.shape
 
+        if masks_pe is None:
+            masks_pe = self.mask_pe
         key_frame_res = self._forward_single_sweep(
             0,
             sweep_imgs[:, 0:1, ...],
             mats_dict,
+            masks_pe,
             is_return_depth=is_return_depth)
         if num_sweeps == 1:
             return key_frame_res
@@ -1543,6 +1592,7 @@ class MaskLSSFPNPredHeight(MaskLSSFPNPred):
                     sweep_index,
                     sweep_imgs[:, sweep_index:sweep_index + 1, ...],
                     mats_dict,
+                    masks_pe,
                     is_return_depth=False)
                 ret_feature_list.append(feature_map)
 

@@ -8,6 +8,7 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp.autocast_mode import autocast
+from bevdepth.utils.height_draw import img_pe
 
 
 class BEVDepthLightningModel(BaseBEVDepthLightningModel):
@@ -296,19 +297,39 @@ class BEVDepthLightningModelPredHeight(BaseBEVDepthLightningModel):
         self.hbound=0.2
         self.height_bins=16
         self.count=0
+        self.semantic_weight = 25
+        self.height_weight = 25
+        
+        # 调整lr 
+        self.basic_lr_per_img = 4e-4 / 64
+    
+    def forward(self, sweep_imgs, mats, mask_pe):
+        return self.model(sweep_imgs, mats, mask_pe)
     
     def training_step(self, batch):
         (sweep_imgs, mats, _, _, gt_boxes, gt_labels, depth_labels, masks_2d) = batch
         masks_2d = self.get_downsampled_masks_2d(masks_2d)
         masks_2d = torch.permute(masks_2d, (0, 1, 4, 2, 3)) # change channel 
+        masks_pe = masks_2d[:, :, 1:3]
         if torch.cuda.is_available():
             for key, value in mats.items():
                 mats[key] = value.cuda()
             sweep_imgs = sweep_imgs.cuda()
             gt_boxes = [gt_box.cuda() for gt_box in gt_boxes]
             gt_labels = [gt_label.cuda() for gt_label in gt_labels]
+            masks_pe = masks_pe.cuda()
+            
+        # import mmcv
+        # import numpy as np
+        # data = {
+        #     'imgs':sweep_imgs.cpu().numpy(),
+        #     'masks_2d':masks_2d.cpu().numpy()
+        # }
+        # path = '/home/yhzn/xiaohuahui/BEVDepth/vis'
+        # mmcv.dump(data,f'{path}/data_expand.pkl')
+        # exit()
         
-        preds, depth_preds, mask_preds, height_preds = self(sweep_imgs, mats)
+        preds, depth_preds, mask_preds, height_preds = self(sweep_imgs, mats, masks_pe)
         if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
             targets = self.model.module.get_targets(gt_boxes, gt_labels)
             detection_loss = self.model.module.loss(targets, preds)
@@ -344,7 +365,7 @@ class BEVDepthLightningModelPredHeight(BaseBEVDepthLightningModel):
     def get_mask_loss(self, gt_mask, pred_mask):
         gt_mask = F.one_hot(gt_mask.to(torch.int64), num_classes=2).permute(0, 3, 1, 2)
         mask_loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask.to(pred_mask))
-        return mask_loss*2
+        return mask_loss*self.semantic_weight
     
     def get_heigth_loss(self, gt_height, gt_mask, pred_height):
         gt_height = gt_height//self.hbound # 高度离散化 B*N, H, W
@@ -352,8 +373,7 @@ class BEVDepthLightningModelPredHeight(BaseBEVDepthLightningModel):
         gt_height = torch.clamp(gt_height, min=0, max=3.1)
         gt_height = F.one_hot(gt_height.to(torch.int64), num_classes=self.height_bins).permute(0, 3, 1, 2)
         height_loss = F.binary_cross_entropy_with_logits(pred_height, gt_height.float())
-        # print(f"height_loss:{torch.isnan(height_loss).any()}")
-        return height_loss*2
+        return height_loss*self.height_weight
 
     def train_dataloader(self):
         train_dataset = NuscDetDataset(ida_aug_conf=self.ida_aug_conf,
@@ -394,7 +414,7 @@ class BEVDepthLightningModelPredHeight(BaseBEVDepthLightningModel):
             for key, value in mats.items():
                 mats[key] = value.cuda()
             sweep_imgs = sweep_imgs.cuda()
-        preds, masks_pred, height = self.model(sweep_imgs, mats)
+        preds, masks_pred, height = self.model(sweep_imgs, mats, masks_pe=None)
         
         # import mmcv
         # save_data = {
@@ -403,7 +423,7 @@ class BEVDepthLightningModelPredHeight(BaseBEVDepthLightningModel):
         #     "pred_mask": masks_pred.cpu().numpy(),
         #     "height": height.cpu().numpy(),
         # }
-        # mmcv.dump(save_data, f"vis/height/mask{self.count}.pkl")
+        # mmcv.dump(save_data, f"vis/height/mask_predheight_mask_best-{self.count}.pkl")
         # self.count += 1
         # if self.count>=4:
         #     exit()

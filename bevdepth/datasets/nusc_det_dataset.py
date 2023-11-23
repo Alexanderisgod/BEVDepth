@@ -755,7 +755,7 @@ class NuscDetDataset(Dataset):
                     if x>=0 and x<w and y>=0 and y<h:
                         # cv2.circle(mask, (int(x), int(y)), 4, (255, 0, 0))
                         mask = torch.from_numpy(mask)
-                        mask = draw_heatmap(mask, (int(x), int(y)), radius_x=int(width//4), radius_y=int(height//4), 
+                        mask = draw_heatmap(mask, (int(x), int(y)), radius_x=int(width//2), radius_y=int(height//2), 
                                             obj_h=(dim[2]).item()/4, index=index, foreground_mask_only=foreground_mask_only)
                         mask = mask.numpy()
             if foreground_mask_only:
